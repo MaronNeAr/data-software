@@ -273,44 +273,222 @@ graph TD
 
 ## Part III: Advanced Features and Optimization
 
-#### Transaction Processing
+#### Performance Tuning（性能调优）
 
+###### 索引优化
 
+- **标准布隆过滤器（Bloom Filters）**：概率型数据结构，快速判断值**不存在**于文件中，适用于高基数列（如ID、邮箱）。
+  - **误判率(FPP)**：通常0.1%-1%。
+  - **空间效率**：约10 bits/元素（FPP=1%时）。
+  - **性能影响**：点查询速度提升 **5-10倍**，额外存储开销约 **1-5%** 空间。
 
-#### Performance Tuning
+- **标准位图索引 (Bitmap Index)**：适用低基数（<10,000唯一值），布尔运算高效（AND/OR），适用于可枚举维度。
 
+- **布隆范围过滤器 (BloomRF)**：解决范围查询问题，将连续范围离散化为多个BloomFilter，适用于指标范围过滤。
 
+- **Min-Max统计索引**：高效过滤数值范围，适用于指标。
 
-#### Iceberg on Cloud Storage
+- **Null计数**：快速排除无值文件。
 
+```mermaid
+graph TD
+    A[选择索引类型] --> B{查询模式}
+    B -->|等值查询| C{列基数}
+    C -->|高基数| D[布隆过滤器]
+    C -->|低基数| E[位图索引]
+    B -->|范围查询| F[Min-Max索引]
+    B -->|多列组合查询| G[Z-Order排序]
+    B -->|点查询+JOIN优化| H[桶分区]
+    B -->|时间序列| I[分区索引]
+```
 
+###### 索引类型
 
-#### Streaming Ingestion with Apache Flink
+| **索引类型**    | 最佳场景           | 空间开销 | 查询复杂度 | 实现复杂度 |
+| :-------------- | :----------------- | :------- | :--------- | :--------- |
+| **标准BF**      | 高基数值存在性检查 | 低       | O(k)       | 低         |
+| **BloomRF**     | 范围查询           | 中高     | O(m×k)     | 高         |
+| **Token BF**    | 单词匹配           | 中       | O(t×k)     | 中         |
+| **NgramBF**     | 子串匹配           | 高       | O(n×k)     | 高         |
+| **标准Bitmap**  | 低基数值           | 中       | O(1)       | 低         |
+| **TokenBitmap** | 文本搜索           | 高       | O(t)       | 高         |
+| **NgramBitmap** | 模糊搜索           | 极高     | O(n)       | 极高       |
+| **Roaring**     | 大范围整数值       | 变长     | O(log n)   | 中         |
 
+###### 排序优化
 
+- **文件内排序（SORT BY）**：在**单个数据文件内部**对行进行排序，使相关数据在物理存储上相邻。
+  - **谓词下推优化**：对排序列的过滤可跳过整个行组。
+  - **高效压缩**：有序数据压缩率提升 20-50%。
+  - **向量化处理**：CPU 缓存命中率提升。
+
+- **文件间排序（DISTRIBUTE BY）**：在**文件之间**建立有序关系，使相关数据集中在特定文件。
+  - **文件级跳过**：WHERE 条件可直接排除无关文件。
+  - **减少清单扫描**：元数据处理开销降低 60-80%。
+  - **优化JOIN性能**：相同键值数据物理集中。
+- **多维排序（Z-Order）**：将多列值映射到Z形空间曲线，保证多列值相近的行物理相邻。
+
+###### 元数据优化（加速查询规划）
+
+- **手动合并小清单文件**：`CALL system.rewrite_manifests('db.table');`
+- **启用元数据缓存（Spark）**：`SET spark.sql.iceberg.metadata.cache-enabled=true;`
+
+###### 场景化优化指南
+
+| **场景**         | **首要优化**                      | **次要优化**      |
+| :--------------- | :-------------------------------- | :---------------- |
+| **点查询**       | 布隆过滤器                        | 桶分区 + 文件排序 |
+| **全表扫描**     | 列裁剪 + 向量化，推荐用ClickHouse | 压缩算法（ZSTD）  |
+| **时间序列分析** | 时间分区 + 排序                   | 元数据缓存        |
+| **高并发写入**   | 清单合并 + 桶分区                 | 增加提交线程      |
+
+#### Transaction Processing（事务处理）
+
+###### 核心机制：乐观并发控制（OCC）
+
+- **读取阶段**：所有写入者读取同一基础快照。
+- **写入阶段**：独立生成新数据文件。
+- **提交阶段**：原子性校验基础快照未被修改。
+- **冲突解决**：若基础快照已变 → 自动重试或失败报错。
+
+###### 写入隔离级别
+
+| **级别**     | 脏读 | 不可重复读 | 幻读 | Iceberg支持   |
+| :----------- | :--- | :--------- | :--- | :------------ |
+| **读未提交** | ✅    | ✅          | ✅    | ❌             |
+| **读已提交** | ❌    | ✅          | ✅    | ✅（默认）     |
+| **快照隔离** | ❌    | ❌          | ⚠️    | ✅（核心优势） |
+| **可串行化** | ❌    | ❌          | ❌    | ❌             |
+
+###### 冲突解决策略
+
+- **并发INSERT**：相同分区路径写入 → 重试时重新分配文件路径。
+- **并发DELETE**：先删者胜，后删者需重试。
+- **元数据冲突**：如同时修改分区策略 → 直接失败。
+
+###### 工作负载隔离（WAP）
+
+- **Write**：写入隔离分支（`branch=staging`）。
+- **Audit**：在分支上验证数据质量。
+- **Publish**：分支合并到 `main`（原子切换）。
+
+###### CDC数据入湖（无锁同步）
+
+```mermaid
+flowchart LR
+  MySQL -->|Debezium| Kafka --> Spark -->|并发写入| Iceberg
+  subgraph 冲突处理
+    Spark --> 重试机制
+    重试机制 --> 成功写入
+  end
+```
+
+#### 
+
+#### Apache Flink流式入湖
+
+###### 核心架构：CDC入湖流水线
+
+- **支持源**：MySQL/Oracle/MongoDB/PG。
+- **CDC格式**：Avro/JSON/Protobuf。
+- **端到端延迟**：秒级（<30s）。
+- **保障机制**
+  - **两阶段提交**：基于Flink Checkpoint机制。
+  - **Iceberg事务隔离**：快照隔离级别。
+
+```mermaid
+graph LR  
+    A[源数据库] -->|Debezium CDC| B(Kafka)  
+    B --> C{Flink SQL}  
+    C -->|实时转换| D[Iceberg Table]  
+    D --> E[OLAP引擎]  
+```
+
+###### 精确一次处理（Exactly-Once）
+
+- **阶段1**：Flink Checkpoint 冻结状态，暂存Iceberg元数据文件。
+- **阶段2**：Checkpoint完成后原子提交快照。
+
+###### 动态分区处理
+
+- **自动分区滚动**：按小时自动分区，`PARTITIONED BY (hours(event_time)) `。
+- **分区触发策略**：
+  - **process-time**：系统时间触发。
+  - **event-time**：数据时间触发（需水位线）。
+- **全量 + 增量同步流程**：Debezium 捕获全量快照，Flink批处理导入Iceberg，切换为增量日志流。
+
+###### Flink CDC参数调优
+
+| **场景**       | **关键配置**                                     | **推荐值** |
+| :------------- | :----------------------------------------------- | :--------- |
+| **高吞吐写入** | `table.exec.iceberg.write.batch-size`            | 2000-5000  |
+| **低延迟处理** | `table.exec.iceberg.write.flush-interval`        | 30s        |
+| **内存优化**   | `taskmanager.memory.task.off-heap.size`          | 2GB        |
+| **背压控制**   | `taskmanager.network.memory.buffers-per-channel` | 4          |
 
 ## Part IV: Ecosystem Integration
 
 #### Query Engines: Trino and Presto
 
+###### 核心连接器架构
 
+- **Iceberg Catalog**：Iceberg目录，表元数据入口。
+- **Metadata Reader**：元数据读取解析清单文件。
+- **Predicate Pushdown**：谓词下推，存储层过滤优化。
 
-#### Data Governance and Catalog Integration
+###### 关键配置参数
 
+| **参数类别**   | **Trino 参数**                        | **Presto 参数**                            | **推荐值** |
+| :------------- | :------------------------------------ | :----------------------------------------- | :--------- |
+| **元数据缓存** | `iceberg.statistics-cache.expiration` | `iceberg.file-statistics-cache.expiration` | 30m        |
+| **并行度控制** | `task.concurrency`                    | `task.concurrency`                         | 8-16       |
+| **内存优化**   | `query.max-memory-per-node`           | `query.max-memory-per-node`                | 4GB        |
+| **小文件合并** | `iceberg.merge-small-files-threshold` | N/A                                        |            |
 
+#### Data Governance and Catalog Integration（数据治理与目录集成）
+
+###### 统一元数据目录架构
+
+- **Business Layer**：数据资产目录 (Collibra/Amundsen)。
+- **Governance Layer**：策略引擎 (Ranger/OPA)。
+- **Catalog Service **：元数据存储 (Nessie/Hive Metastore)。
+- **Iceberg Table Format**：表元数据 (Manifests/Partition Specs)。
+- **Storage Layer**：云存储/对象存储。
+
+###### 数据治理工具集成
+
+- **Apache Ranger数据安全**：支持库/表/列级访问，控制行过滤（Row Filtering）和数据脱敏（Masking）。
+- **Apache Atlas数据血缘**： 血缘信息包含数据来源、转换逻辑（ETL Process）、输出目标、列级映射（Column Mapping）。
 
 #### Iceberg in the Modern Data Stack
 
+###### 现代数据栈架构定位
 
+- **核心角色**：开放表格式层（Open Table Format）。
+- **关键价值**：解耦计算与存储、统一批流处理、支持多引擎读写、实现湖仓一体架构。
 
-## Part V: Production Operations
+| Layer                | 典型组件                  | Iceberg 集成点        |
+| -------------------- | ------------------------- | --------------------- |
+| 数据摄取 (Ingest)    | Kafka,Flink CDC           | CDC入湖，流批统一入口 |
+| 数据存储 (Storage)   | S3,OSS                    | 原生支持对象存储格式  |
+| 表格式 (Table)       | Iceberg, Delta Lake, Hudi | 核心层                |
+| 转换引擎 (Transform) | Spark, Flink              | 无缝集成SQL和代码转换 |
+| 查询引擎 (Query)     | Trino, Snowflake          | 高性能连接器          |
+| 数据目录 (Catalog)   | Apache Atals, DataHub     | 元数据发现与治理      |
+| BI工具 (Visualize)   | Tableau,Power BI          | 直连分析              |
 
-#### Monitoring and Maintenance
+###### 关键集成场景
 
+- **批流一体管道**：Kafka ➡️ Flink/Spark ➡️ Iceberg ➡️  ETL&adhoc
 
+- **反向ETL操作**：数据仓库 ➡️ Iceberg表 ➡️ 业务系统
 
-#### Scaling Iceberg to Petabyte Scale
+###### 现代数据栈工具链整合
 
-
-
-#### Security Best Practices
+| **工具类别**     | **代表产品**       | **Iceberg集成方式**    | **核心价值**      |
+| :--------------- | :----------------- | :--------------------- | :---------------- |
+| **数据编排**     | Airflow, Dagster   | Python SDK / Operator  | 统一调度批流任务  |
+| **数据质量**     | Great Expectations | 检查点集成             | 入湖时数据验证    |
+| **数据可观测性** | Monte Carlo        | 元数据扫描             | 血缘追踪+异常检测 |
+| **指标层**       | dbt Metrics        | dbt-iceberg适配器      | 统一指标定义      |
+| **实时分析**     | StarRocks          | External Iceberg Table | 亚秒级响应        |
