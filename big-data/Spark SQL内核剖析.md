@@ -142,9 +142,12 @@ graph LR
 ###### Spark SQL连接实现算法
 
 - **Shuffled Hash Join（分区哈希连接）**
+
   - **Shuffle阶段**：两表数据按 Join Key 重新分区；相同 Key 的数据发送到同一 Executor。
   - **Build阶段**：每个 Executor 将**小分区**数据构建内存哈希表。
   - **Probe阶段**：扫描**大分区**数据，在哈希表中查找匹配项。
+
+  - **适用场景**：**中等规模数据集**（单分区数据可装入内存）；**Key分布均匀**，无严重数据倾斜；两表规模相当（无显著大小差异）。
 
 - **Broadcast Hash Join（广播哈希连接）**
   - **广播阶段**：Driver 将**小表全量数据**发送给所有 Executor。
