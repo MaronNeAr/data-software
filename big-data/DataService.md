@@ -1,27 +1,28 @@
 ## Component
 
-#### api-governance
+#### ApiGovernance
 
 ###### Domain(orchestra)
 
 - **Entity**
-
   - **Field**：包含字段名、依赖字段以及计算类型，如`(t1.a - t2.b) / t1.a AS field`。
-
+  
   - **DagNode**：DAG节点，包含输入节点、输出节点以及ApiOrchestraNode（API编排节点）。
-
+  
   - **ApiRule**：API规则，包含API ID、请求表达式映射、结果输出映射及默认请求参数。
-
+  
   - **JoinRule**：Join规则，包含Join节点ID、左Join逻辑、右Join逻辑、连接类型和连接条件。
-
+  
   - **AggregateRule**：聚合规则，包含计算字段集合以及聚合字段集合。
   - **CompositeCalcRule**：组合计算规则，包含返回字段及其计算表达式。
-
+  
   - **EndRule**：节点结束规则，包含节点输出字段、对输出字段过滤以及节点输入和输出字段的映射。
+  
+- **DagContext**：DAG上下文，包含开始节点、节点Map（视图ID及其查询结果集）、DAG执行工厂、API信息、API上下文、API执行方法。
+
+- **DagAppService**：DAG服务，若父节点未执行完毕，则异步并行执行父节点任务，然后执行当前节点任务；若当前节点非结束节点，则异步执行当前节点，否则同步执行当前节点，便于调用方收集结果。
 
 - **Excutor**
-
-  - **DagContext**：DAG上下文，包含开始节点、节点Map（视图ID及其查询结果集）、DAG执行工厂、API信息、API上下文、API执行方法。
   - **ApiNodeFactory**：API节点工厂，包含生成API上下文方法、生成API实例方法、表达式创建OS请求方法、创建返回结果方法。
   - **DagNodeExecutor**：DAG节点执行器，声明了执行方法。
   - **ApiNodeExecutor**：首先根据DAG节点获取API编排规则及业务API信息，进而通过ApiNodeFactory生成API上下文，通过API上下文执行API查数方法获取数据结果，最后将查数结果通过API规则的OutputMapper进行映射返回节点输出结果。
@@ -30,6 +31,7 @@
   - **CompositeCalcNodeExecutor**：基于MVEL表达式计算字段展示值，如`SELECT a.amount + b.amount AS amount`。
   - **StartNodeExecutor**：节点开始处理逻辑，加载所有依赖API最大可用分区。
   - **EndNodeExecutor**：节点结束处理逻辑，字段裁剪、数据过滤、结果映射。
+  
 
 ###### Interface
 
@@ -121,11 +123,66 @@
 
 ###### Application
 
-- 
+- **RpcV3LogAgentAspect**：日志代理切面，上报API执行日志，包含请求开始日志、请求结束日志、鉴权失败日志、限流日志。
+- **Assembler**
+  - **ApiAliasFieldAssembler**：API别名转换，包含模型请求参数别名转换、填充排序字段及高级筛选字段。
+  - **ApiMaxPartitionRespAssembler**：API最大分区转换，用于转换API最大分区。
+  - **ApiRespAssembler**：API响应转换，通过QueryResp转换为ApiResp。
+  - **AsyncAssembler**：异步请求转换。
+  - **CalculateQueryReqAssembler**：计算查询请求转换。
+  - **CalculateQueryRespAssembler**：计算查询响应转换。
+  - **DegradeInfoAssembler**：降级信息转换。
+  - **MixtureQueryRespAssembler**：混合计算响应转换。
+  - **OpenApiRespAssembler**：OpenApi响应转换。
+  - **OperatorFieldAssembler**：操作符字段转换。
+  - **QueryReqAssembler**：查询请求转换。
+  - **QueryRespAssembler**：查询响应转换。
+  - **SqlRespAssembler**：SQL响应转换。
+
+- **OpenApiContext**：API上下文，包含API ID、请求参数、二次计算请求参数、API实例信息、协议类型、实例QPS、编排信息。
+- **Service**
+  - **DataQueryBeforeHandleAppService**：数据查询前置处理服务，用户未请求及非结果集计算字段不处理。
+  - **DataQueryAppService**：数据查询服务，封装引擎查数逻辑，将EngineQueryReq下发到engine应用进行数据查询。
+  - **DataQueryAfterHandleAppService**：数据查询后置处理服务，包括结果集计算、响应字段裁剪。
+  - **DataStatusAppService**：数据状态服务，包含获取API最后分区、API数据状态。
+  - **DataDegradeAppService**：数据降级服务，包含离线请求降级（替换时间类型请求参数）、任务最大分区查询。
+  - **PageQueryAppService**：分页查询服务，包含分页数据查询和分页总数查询。
+  - **MockQueryAppService**：Mock查询服务，当实际数据未就绪时，提供Mock数据。
+  - **TemplateBuildSqlAppService**：模板构建SQL服务，通过SQL模板参数透传生成SQL，类似于Mybatis的Mapper映射。
+  - **OrchestraBuildQueryAppService**：编排构建查询服务，执行API编排逻辑，从开始节点进行执行，对其依赖节点进行拓扑排序，依次执行节点数据任务，最终返回编排结果。
 
 ###### Auth
 
 - **ApiAuth**：API调用校验，调用方必须和所申请的appId、appKey、secret相一致。
 - **PreventSqlInjection**：防止SQL注入，对SQL注入进行检查，并能够快速编译生成安全（非注入）SQL进行查询。
 
+#### Translate
+
+
+
+#### Engine
+
+
+
+#### CacheSupport
+
+###### Config
+
+- **CaffeineCacheSupportConfig**：Caffeine本地缓存支持配置，包括分批回源条数、降级缓存和回源方法。
+- **RedissonSupportConfig**：Redis支持配置，包含缓存TTL时间、时间单位、缓存分片数。
+
+###### Support
+
+- **CaffeineCacheSupport**：Caffeine缓存，包含单key查询、批量查询、异步查询、写缓存。
+
+  - **异步查询**：请求包含Caffeine本地缓存、请求ID集合、异步回源方法、缓存配置；默认读主缓存，失效读降级缓存，缓存不存在则调用回源方法查数并写缓存。
+
+    ```java
+    getsAsync(Cache<CK, V> cache, Collection<CK> ids, Function<Collection<CK>, CompletableFuture<Map<CK, V>>> asyncBackSourceFunc, CaffeineCacheSupportConfig<CK, CK, V> config);
+    ```
+
+- **RedissonSupport**：Redis缓存，包括单key查询、批量查询、异步查询、异步写入、异步删除方法。
+
 ## Application
+
+- 
