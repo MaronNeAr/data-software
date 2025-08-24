@@ -158,7 +158,110 @@
 
 #### Translate
 
+###### Domain
 
+- **Model**
+  - **LogicModel**：逻辑模型，包括引擎模型、模型元信息、是否真正翻译tdm、字段信息、是否模型快照等。
+  - **LogicRbm**：rbm加速逻辑，包含查询维度、主键维度、查询指标和需要构建的逻辑表。
+  - **LogicTag**：标签逻辑，包含分区字段和标签字段。
+  - **ParserModel**：解析模型，包括模型信息及其模型字段信息。
+  - **ControlModel**：控制模型，是否星座模型、是否跨源、是否基数探查。
+  
+- **ParserService**
+
+  - **ParserService**：解析服务，（待补充）
+
+  - **TranslateRbmService**：
+
+  - **TranslateTemplateService**：SQL模版翻译服务，主要包含taishanKv翻译服务以及SQL模版翻译服务。
+
+    > SQL模版翻译：首先使用占位符解析${name}的类型和默认值，然后遍历paramFilters匹配字段名，值不存在时使用默认值，两者都为空则抛异常，接着对字段进行类型转换，最后进行模版替换构建，单值直接替换，多值拼接为逗号分隔。
+    >
+    > taishanKv翻译：首先合并指标和维度字段，然后对Cube模型进行特殊处理（包括验证维度组合的合规性、补充缺失维度的默认值），接下来获取分区字段配置自动补全过滤条件的默认值，最后根据是否开启扫描模式选择不同模版进行模版替换。
+    >
+    > SQL模版动态替换：包括分页参数处理、排序方式设置以及维度条件过滤，如果是分区表需要单独处理分区逻辑。
+
+  - **TranslateTableService**
+
+    > **引擎路由**：对TAISHANKV引擎复用`translateTaiShan`逻辑，其他引擎走标准SQL翻译流程。
+    >
+    > **字段分类处理**：计算字段通过依赖字段以及计算表达式生成；虚拟字段单独分组处理；普通字段直接加入Select列表。
+    >
+    > **SELECT**：通过响应resp以及别名映射组合普通字段、虚拟字段（包括计算字段依赖字段）以及计算字段。
+    >
+    > **FROM**：支持模板表名或物理表名。
+    >
+    > **WHERE**：解析基础过滤条件和高级过滤条件。
+    >
+    > **GROUP BY**：自动生成分组条件，非计算字段进行group by。
+    >
+    > **HAVING**：处理聚合后过滤。
+
+  - **TranslatePageService**
+
+    > **总条数查询**：直接复用原始查询SQL包装成COUNT查询总条数。
+    >
+    > **分页构造**：起始位计算`(pageNum-1)*pageSize`，Iceberg使用OFFSET模板，其他引擎使用标准LIMIT语法。
+
+  - **TranslateModelUnionService**：多模型联合查询逻辑，构建SELECT子句(维度+普通指标)，通过metaRpcService获取复合指标定义，递归构建复合指标表达式，使用AST模板生成最终SQL。
+
+###### Infrastructure
+
+- **MetaRpcService**：元信息RPC服务，包含业务字段查询、业务模型查询及模型字段查询。
+- **ASTReplaceUtil**：模板替换工具，主要用于将对象属性值动态注入到字符串模板中。
+- **ASTTranslateUtil**：SQL翻译工具类，主要负责模型查询场景的SQL片段生成与组装，包括LIMIT、ORDER BY、WHERE筛选（=、>、>=、<、<=、in、contains、between等）以及多模型跨源指标计算。
+- **SqlParseUtil**：SQL解析工具类，专注于动态参数替换和类型安全转换。
+- **TdmTimeUtil**：处理TDM（时间驱动模型）场景下的日期分区下推逻辑，计算wtd、mtd、qtd、mtd。
+
+###### Application
+
+- **Assembler**
+
+  - **TranslateReqFieldAssembler**：字段映射转换的核心装配器，包含字段映射转换、多维处理以及递归处理。
+  - **TranslateSqlAliasAssembler**：SQL别名处理器，包括SQL别名映射转换、SQL重构以及动态适配。
+  - **TranslateModelFieldAssembler**：模型字段技术表达式处理器，包含高级字段解析、表达式处理和模版引擎。
+
+- **Service**
+
+  - **LevelSelect**：ClickHouse 一级 SELECT 语句生成器，包含多类型字段处理、表达式生成和FULL JOIN适配器。
+
+  - **ModelASTService**：模型抽象树解析服务，包含SQL表达式解析、AST树操作（三层SQL处理）和函数映射。
+
+    > **一级查询（基础查询层）**：基础字段表别名处理、FULL JOIN字段CASE WHEN表达式生成、实时计算字段类型转换。
+    >
+    > **二级查询（过滤聚合层）**：构建WHERE过滤条件、GROUP BY聚合逻辑。
+    >
+    > **三级查询（衍生计算层）**：构建高级计算表达式，如嵌套指标计算、时间窗口函数处理和跨模型字段处理。
+    >
+    > **SQL表达式解析**：将业务模型中的维度/指标表达式转化为标准SQL。
+    >
+    > **AST树操作**：通过抽象语法树实现SQL模板的动态替换与优化。
+    >
+    > **函数映射**：处理不同数据源间的函数兼容性问题。
+
+  - **ModelRbmProduceASTService**：RBM查询生产服务，包括维度基数探查优化、物化试图预计算、跨层指标继承。
+
+  - **ModelRbmConsumeASTService**：RBM查询消费服务，包含动态JOIN优化、主键维度识别和基数探查。
+
+  - **TagProduceASTService**：标签生产抽象数服务，包含以下业务：
+
+    > **单数据源标签**：直接生成带过滤条件的SELECT语句。
+    >
+    > **多数据源合并**：通过UNION ALL合并后GROUP BY去重。
+    >
+    > **历史标签回溯**：利用log_date/log_hour分区字段实现时间切片。
+    >
+    > **异构数据源整合**：处理不同来源的字段类型差异。
+
+  - **TranslateService**：翻译服务总控调度器，主要负责多引擎翻译路由、模板缓存优化和翻译过程监控。
+
+  - **TranslateClickhouseService**：ClickHouse查询生成服务，主要负责多层SQL构造**、**复合指标处理和跨模型关联查询，支持OLAP场景下的复杂分析查询。
+
+  - **TranslateTaiShanService**：TaishanKv查询生成服务，主要负责维度排列组合、TaishanKey智能构建和多模型查询支持。
+
+  - **TranslateJoinService**：多表关联查询生成服务，包含多表JOIN构建、动态别名管理、嵌套条件解析和跨引擎适配。
+
+  - **TranslateDetailService**：明细查询SQL生成服务，包含多表别名管理、字段映射转换、FULL JOIN适配以及跨引擎兼容。
 
 #### Engine
 
