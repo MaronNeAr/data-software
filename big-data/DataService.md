@@ -265,9 +265,14 @@
 
 #### Engine
 
+- **EngineClickHouseDataSourceDirectWorker**：ClickHouse直连数据查询。
+- **EngineIcebergDataSourceDirectWorker**：Iceberg直连数据查询。
+- **EnginePrestoDataSourceDirectWorker**：Presto直连数据查询。
+- **EngineNewMysqlDataSourceSyncWorker**：MySQL同步数据查询。
+- **EngineTaiShanDataSourceSyncWorker**：Taishan同步数据查询。
+- **EngineTiDBDataSourceSyncWorker**：TiDB同步数据查询。
 
-
-#### CacheSupport
+#### **CacheSupport**
 
 ###### Config
 
@@ -286,6 +291,3 @@
 
 - **RedissonSupport**：Redis缓存，包括单key查询、批量查询、异步查询、异步写入、异步删除方法。
 
-## Application
-
-- 
