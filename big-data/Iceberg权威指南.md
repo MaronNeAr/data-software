@@ -383,8 +383,6 @@ flowchart LR
   end
 ```
 
-#### 
-
 #### Apache Flink流式入湖
 
 ###### 核心架构：CDC入湖流水线
