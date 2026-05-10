@@ -951,6 +951,10 @@ go tool objdump -s "main\.main" ./binary
   }
   ```
 
+#### Go配置
+
+- GOROOT表示源码包所在路径
+- GOPATH开发者GO的项目默认路径 
 
 ## 第七部分 Clickhouse-Go源码
 
