@@ -1,5 +1,9 @@
 # Linux源码学习
 
+###### 前言
+
+建议边看源码边看文档：https://github.com/torvalds/linux/
+
 ## 第一部分 进程与计算管理（生命的诞生与调度）
 
 #### fork 系统调用
@@ -274,10 +278,35 @@
   - `__O_TMPFILE`：匿名临时文件。没有目录项的匿名文件；不在任何目录中，其他进程看不到；进程退出或 fd 关闭后自动消失
   - `O_PATH`：路径引用。不真正打开文件，只获取路径引用，不检查文件读写权限
   - `path_init(nd, flags)`：确定解析起点，返回待解析的路径字符串
-  - `link_path_walk(s, nd)`：负责按当前目录查找 /home/user/，`foo.txt` 留给 `open_last_lookups`进行处理
+  - `link_path_walk(s, nd)`：负责按当前目录查找 /home/user/
+  - `open_last_lookups`：处理`foo.txt` ，查找最后一个分量 "foo.txt" 的 dentry，到后存入 nd->path.dentry
   - `terminate_walk(nd)`：清理路径解析过程中持有的引用（dentry 引用、RCU 临界区等）
 
-- `do_path()`：路径解析已经完成，inode 已经找到，`do_open` 负责最后一公里：权限检查、处理各种 flag 语义、真正打开文件
+- `do_open()`：路径解析已经完成，inode 已经找到，`do_open` 负责最后一公里：权限检查、处理各种 flag 语义、真正打开文件
+
+  ```c
+  complete_walk()          RCU → 普通引用，稳定 dentry
+        │
+  audit_inode()            记录访问审计日志
+        │
+  O_CREAT 检查            	O_EXCL？目录？sticky？
+        │
+  LOOKUP_DIRECTORY 检查			路径必须是目录？
+        │
+  截断权限处理								新建文件免检查，已有文件申请写权限
+        │
+  may_open()               	读/写/执行权限检查
+        │
+  vfs_open()               	调用文件系统 .open()，填充 file
+        │
+  security_file_post_open() LSM 安全策略
+        │
+  handle_truncate()        	执行 O_TRUNC 截断
+        │
+  mnt_drop_write()         	释放写引用
+        │
+  return error
+  ```
 
   - `FMODE_CREATED`：文件是刚刚新建的（O_CREAT 且之前不存在）
 
@@ -313,35 +342,124 @@
 
   - `mnt_want_write`：申请挂载点写权限
 
-- `denstry`：是 Linux VFS 层的一个内存对象，表示路径中的一个分量
+  - `may_open`：权限检查，检查进程是否有权限以 acc_mode 访问这个文件
+
+  - `vfs_open`：真正打开文件，填充 file 结构体，并标记打开成功
+
+    ```c
+      file->f_op    = inode->i_fop
+      file->f_inode = inode
+      file->f_mode |= FMODE_OPENED   ← 标记打开成功
+    ```
+
+  - `security_file_post_open`：LSM 安全检查，做最终的安全策略检查
+
+  - `handle_truncate`：执行实际的截断操作
+
+- `vps_open`：是 VFS 层打开文件的**最后入口**，把已经找到的路径（`path`）和已经分配的空壳（`file`）真正关联起来
+
+  - `file->__f_path = *path`：绑定路径，把路径信息写入 file 对象
+
+    ```c
+    struct path {
+        struct vfsmount *mnt;    // 挂载点信息
+        struct dentry   *dentry; // 目录项（连接文件名和inode）
+    };
+    ```
+
+  - `do_dentry_open`：真正打开文件的过程，填充 file 对象（inode、页缓存、文件操作函数表），检查文件类型和权限
+
+    ```c
+    static int do_dentry_open(struct file *f, struct inode *inode) {
+        // 1. 从 dentry 取出 inode
+        inode = f->f_path.dentry->d_inode;
+    
+        // 2. 填充 file 对象
+        f->f_inode = inode;
+        f->f_mapping = inode->i_mapping;  // 页缓存映射
+        f->f_op = fops_get(inode->i_fop); // 文件操作函数表
+    
+        // 3. 检查文件类型和权限
+        if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode))
+            // 块设备/字符设备特殊处理
+    
+        // 4. 调用具体文件系统的 .open()
+        if (f->f_op->open) {
+            ret = f->f_op->open(inode, f);
+            // ext4_file_open()
+            // nfs_file_open()
+            // socket 的 sock_open()
+            // 等等...
+        }
+    
+        // 5. 标记打开成功
+        f->f_mode |= FMODE_OPENED;
+    }
+    ```
+
+  - file 执行过程
+
+    ```c
+    执行前：                        执行后：
+    file {                          file {
+      __f_path = path ✓               __f_path = path ✓
+      f_flags  = O_RDWR ✓             f_flags  = O_RDWR ✓
+      f_inode  = NULL ✗               f_inode  = inode 1234 ✓
+      f_op     = NULL ✗               f_op     = &ext4_file_ops ✓
+      f_mode   = 0 ✗                  f_mode   = FMODE_OPENED ✓
+      f_mapping= NULL ✗               f_mapping= &inode->i_mapping ✓
+    }                               }
+    ```
+
+  - `fsnotify`：内核的文件系统事件通知框架
+
+    ```c
+    fsnotify_open(file)
+          │
+          ├──▶ inotify     用户态 inotify_add_watch() 注册的监听
+          │      │
+          │      └──▶ 应用程序收到 IN_OPEN 事件
+          │
+          ├──▶ fanotify    更强大的文件访问通知（可以拦截！）
+          │      │
+          │      └──▶ 安全软件收到通知，可以允许或拒绝访问
+          │
+          └──▶ dnotify     老式目录变更通知
+    ```
+
+- `denstry`关联`inode`
 
   ```c
-  磁盘                    内存（VFS层）
-  
-                      dentry ("foo.txt")
-                      ├─ d_name = "foo.txt"    ← 文件名
-                      ├─ d_parent → dentry("user")  ← 父目录
-                      ├─ d_inode ──────────────────────┐
-                      └─ d_op                          │
-                                                       ▼
-                      inode (inode号 42)
-  ext4 inode 42  ←── ├─ i_mode  (权限)
-                      ├─ i_size
-                      ├─ i_fop  (file_operations)
-                      └─ i_mapping (页缓存)
-  
-                      file (每次open一个)
-                      ├─ f_path.dentry → dentry
-                      ├─ f_inode       → inode
-                      ├─ f_pos         (当前读写位置)
-                      └─ f_op          → inode->i_fop
+  lookup_dcache()     先查内存中的 dentry cache
+      │
+      ├─ 命中 → dentry->d_inode 已经有了，直接用
+      │
+      └─ 未命中 → lookup_slow()
+                      │
+                      └─ 调用文件系统的 .lookup()
+                           ext4_lookup()
+                               │
+                               └─ 读磁盘，找到 inode 号
+                                  创建 dentry
+                                  d_add(dentry, inode)  // 绑定
+                                  存入 dcache
   ```
 
-  | 结构       | 代表什么               | 生命周期                     |
-  | ---------- | ---------------------- | ---------------------------- |
-  | **dentry** | 路径树中的一个名字节点 | 可缓存（dcache），与路径绑定 |
-  | **inode**  | 文件本身（数据、权限） | 与磁盘上的 inode 对应        |
-  | **file**   | 一次 open 的上下文     | 每次 open 创建，close 销毁   |
+- `O_DIRECT`（直接 I/O）
+  - 内核行为：当你在 `open` 时传入这个标志，内核在 `do_dentry_open()` 中填充 `file` 对象时，会取消或者绕过 `file-> f_mapping`（页缓存 Page Cache）的默认托管算子
+  - 联动真相：后续调用 `write` 时，数据不再拷贝进内核的 Page Cache，而是通过 DMA 硬件技术，直接把用户态的内存缓冲区（User Buffer）对撞写入物理磁盘
+  - 应用场景：这是数据库和存储引擎为了防止 Page Cache 带来二次内存拷贝损耗、自研缓存置换算法（如 LRU）的绝对大招
+- `O_SYNC`（同步 I/O）
+  - 内核行为：在 `open_flags` 中打上同步标记
+  - 联动真相：后续的每一次 `write()` 系统调用，在进入内核后都会自动追加一个隐式的 `fsync()` 动作。只有当磁盘硬件用中断信号回复“数据已安全落盘”时，`write` 系统调用才允许返回用户态
+  - 应用场景：MySQL 的 WAL（预写日志）之所以能保证断电不丢，全靠它在 `open` 时的这一条铁律
+- `LOOKUP_RCU`（无锁快速冲刺）
+  - 应用场景：在高并发下，几万个线程同时调用 `open("/home/user/foo.txt")`。如果采用传统的加锁遍历，每个线程去读取 `/`、`home`、`user` 的 `dentry` 时都要去争抢读写锁，多核 CPU 的算力全都会浪费在等待锁引起的上下文切换上
+  - `LOOKUP_RCU`：内核在进入 `path_init` 时，默认给当前线程打上 `LOOKUP_RCU` 标志。在随后的 `link_path_walk()` 逐级解析中，内核**不增加任何 dentry 的引用计数（不改写内存），也不加任何锁**。它完全信任当前的 RCU 内存临界区，顺着 Dentry 缓存（dcache）的哈希表指针一路狂奔
+  - 冲突退化：如果在狂奔的过程中，另一个 CPU 核心刚好删除了 `user` 目录（引发了内存改写）。当前线程通过序列号验证（Sequence Count）发现数据被动过了，路径解析会立刻中止，抛出 `-ECHILD` 错误，退出 RCU 模式。接着，内核才会重新调用普通加锁解析，老老实实去加锁、拿引用计数、甚至去读磁盘（`lookup_slow()`）
+- `Symbolic Link`符号链接
+  - 防止无线死循环和栈溢出：如果一个黑客故意在磁盘上创建了两个互相指向对方的软链接：`a -> b` 且 `b -> a`。当用户调用 `open("a")` 时，如果不加限制，内核的 `link_path_walk()` 会陷入无限递归调用，最终导致内核栈（Kernel Stack，只有 8KB/16KB）彻底爆掉，引发整个操作系统崩溃（Kernel Panic）
+  - 内核解法：在你的 `struct nameidata` 上下文中，有两个关键字段：`depth`（当前符号链接嵌套深度）和 `total_link_count`（总解析符号链接数）。内核在 `follow_link()` 里死死限定：软链接嵌套深度不能超过 8 层，一次 open 里的软链接总数不能超过 40 个。一旦超过，立刻返回 `-ELOOP`（Too many levels of symbolic links）错误
 
 #### close / rename 系统调用
 
@@ -415,6 +533,36 @@
   | 块设备   | `d_is_blk`                  | `/dev/sda`         |
   | 管道     | `d_is_fifo`                 | `mkfifo` 创建的    |
   | socket   | `d_is_sock`                 | Unix domain socket |
+
+- `denstry`：是 Linux VFS 层的一个内存对象，表示路径中的一个分量
+
+  ```c
+  磁盘                    内存（VFS层）
+  
+                      dentry ("foo.txt")
+                      ├─ d_name = "foo.txt"    ← 文件名
+                      ├─ d_parent → dentry("user")  ← 父目录
+                      ├─ d_inode ──────────────────────┐
+                      └─ d_op                          │
+                                                       ▼
+                      inode (inode号 42)
+  ext4 inode 42  ←── ├─ i_mode  (权限)
+                      ├─ i_size
+                      ├─ i_fop  (file_operations)
+                      └─ i_mapping (页缓存)
+  
+                      file (每次open一个)
+                      ├─ f_path.dentry → dentry
+                      ├─ f_inode       → inode
+                      ├─ f_pos         (当前读写位置)
+                      └─ f_op          → inode->i_fop
+  ```
+
+  | 结构       | 代表什么               | 生命周期                     |
+  | ---------- | ---------------------- | ---------------------------- |
+  | **dentry** | 路径树中的一个名字节点 | 可缓存（dcache），与路径绑定 |
+  | **inode**  | 文件本身（数据、权限） | 与磁盘上的 inode 对应        |
+  | **file**   | 一次 open 的上下文     | 每次 open 创建，close 销毁   |
 
 ## 第四部分 网络与进程间通信
 
