@@ -213,7 +213,7 @@
   - `int open(const char *pathname, int flags, mode_t mode);`
   - `int openat(int dirfd, const char *pathname, int flags, mode_t mode);`
   - openat 函数比 open 多了 dirfd，表示目录文件描述符
-  - 如果 filename 是绝对路径，dirfd 直接呗忽略，效果和 open() 一样
+  - 如果 filename 是绝对路径，dirfd 直接被忽略，效果和 open() 一样
   - 如果 filename 是相对路径，内核不再去看进程的 CWD，而是以 dirfd 指向的特定目录为基准，去解析后面的相对路径
 
 - `openat()`和`openat2()`
@@ -446,10 +446,12 @@
   ```
 
 - `O_DIRECT`（直接 I/O）
+  
   - 内核行为：当你在 `open` 时传入这个标志，内核在 `do_dentry_open()` 中填充 `file` 对象时，会取消或者绕过 `file-> f_mapping`（页缓存 Page Cache）的默认托管算子
   - 联动真相：后续调用 `write` 时，数据不再拷贝进内核的 Page Cache，而是通过 DMA 硬件技术，直接把用户态的内存缓冲区（User Buffer）对撞写入物理磁盘
   - 应用场景：这是数据库和存储引擎为了防止 Page Cache 带来二次内存拷贝损耗、自研缓存置换算法（如 LRU）的绝对大招
 - `O_SYNC`（同步 I/O）
+  
   - 内核行为：在 `open_flags` 中打上同步标记
   - 联动真相：后续的每一次 `write()` 系统调用，在进入内核后都会自动追加一个隐式的 `fsync()` 动作。只有当磁盘硬件用中断信号回复“数据已安全落盘”时，`write` 系统调用才允许返回用户态
   - 应用场景：MySQL 的 WAL（预写日志）之所以能保证断电不丢，全靠它在 `open` 时的这一条铁律
