@@ -117,13 +117,13 @@
 
 - 原始 Attention 需要把完整的 QK^T 矩阵（大小 S×S）写到 HBM，再读回来做 Softmax，内存带宽成瓶颈。Flash Attention 通过分块计算（tiling）完全在 SRAM 内完成，彻底规避 HBM 往返。
 
-<img src="https://p.ipic.vip/as8gop.png" alt="image-20260526150053785" style="zoom:50%;" />
+<img src="https://p.ipic.vip/3hoj04.png" alt="image-20260526150053785" style="zoom:50%;" />
 
 ###### 第四步：KV Cache 写入——Prefill 唯一的"遗产"
 
 - Prefill 阶段的核心产出就是 KV Cache。每个 Transformer 层，每个 token 的 K 向量和 V 向量被持久化到 GPU HBM，供后续所有 Decode step 反复读取。
 
-  <img src="/Users/marlon1475/Library/Application Support/typora-user-images/image-20260526153430613.png" alt="image-20260526153430613" style="zoom:50%;" />
+  <img src="https://p.ipic.vip/unbtp1.png" alt="image-20260526153430613" style="zoom:50%;" />
 
 - KV Cache 是显存的最大消耗者。FP8 量化 KV Cache 可以将其减半，但需要额外的反量化开销。前缀缓存（Prefix Caching）让相同 system prompt 的请求直接复用已有 KV Block，避免重复 Prefill。
 
@@ -131,7 +131,7 @@
 
 - Attention 子层之后，每个 Transformer 层还有 FFN（前馈网络）、两个 LayerNorm 和两条残差路径。这些操作在 Prefill 中同样是并行处理所有 S 个 token。
 
-  <img src="/Users/marlon1475/Library/Application Support/typora-user-images/image-20260526154921798.png" alt="image-20260526154921798" style="zoom:50%;" />
+  <img src="https://p.ipic.vip/jngf5q.png" alt="image-20260526154921798" style="zoom:50%;" />
 
 - GQA（Grouped Query Attention）通过让多个 Query head 共享一组 K/V head，把 KV Cache 减小 8× 以上，同时基本不损失精度。Llama-3 / Mistral 等都采用了 GQA。
 
@@ -139,7 +139,7 @@
 
 - 把前面所有步骤汇总，看 Prefill 阶段的算力消耗、显存占用和时延的完整数学图景。这决定了 TTFT 能做到多低。
 
-  <img src="/Users/marlon1475/Library/Application Support/typora-user-images/image-20260526154959397.png" alt="image-20260526154959397" style="zoom:50%;" />
+  <img src="https://p.ipic.vip/f7s730.png" alt="image-20260526154959397" style="zoom:50%;" />
 
 - TTFT 优化核心路径：
   - ① FP8/INT8 量化（降低 FLOP 和显存带宽）
