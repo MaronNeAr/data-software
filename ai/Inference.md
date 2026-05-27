@@ -247,3 +247,23 @@
 - **减少每步需读取的权重字节数（降低带宽压力）**：量化是这里的核心手段。INT8 将每个参数从 2 字节压到 1 字节，权重读取量减半，TBT 理论上减半。INT4（GPTQ/AWQ）进一步压到 0.5 字节，但需要仔细的校准来控制精度损失。FP8 是 H100 原生支持的最优方案：精度损失极小，速度接近 INT8。
 - **让一次大模型前向产出更多 token（突破串行上限）**：投机解码（Speculative Decoding）通过草稿模型预测 k 个候选，大模型并行验证，实现 2-4× 的有效 TBT 改善。Medusa 是变体方案，在同一模型末尾加多个并行头，无需单独草稿模型。
 - **减少 KV Cache 体积（让更多请求同时驻留）**：GQA（Grouped Query Attention，LLaMA-3 / Qwen2 标配）把 K/V head 数量从 H 降到 H/G，KV Cache 体积降低 G 倍。KV Cache 量化（INT8/FP8）进一步减半。前缀缓存（Prefix Caching）让共享 system prompt 的请求复用同一份 KV Cache，从根本上减少 KV 存储需求。
+
+## 第二部分 KV Cache管理
+
+#### 内存分配与预留模块（Memory Allocator & Profiler）
+
+
+
+#### 逻辑地址转换与页表管理模块（Page Table & Mapping Manager）
+
+
+
+#### 并发调度与生存周期管理模块（Scheduler & Eviction Manager）
+
+
+
+#### 多卡分布式同步与共享模块（Distributed Sync & Prefix Cache Manager）
+
+
+
+## 第三部分 Model Optimization
