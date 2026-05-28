@@ -20,7 +20,63 @@
 
 <img src="https://p.ipic.vip/ujb49r.png" alt="image-20260526133356353" style="zoom:50%;" />
 
+- **Prefill Stage（预填充/预热阶段）**
+  - **定义：** 推理引擎处理用户输入 Prompt 的首要阶段。
+  - **计算性质：** **Compute-bound（算力密集型）**。
+  - **算子本质：** **GEMM (General Matrix Multiplications，矩阵-矩阵乘法)**。
+  - **技术特征：** 输入为 $S$ 个 Token 组成的矩阵 $[S, d]$。由于全量 Token 一次性并行输入，权重矩阵（Weights）在片上缓存（SRAM/Shared Memory）中被高频复用，计算访存比（Operational Intensity）极高，可完美榨干 GPU Tensor Cores 的峰值算力。
+  - **系统行为：** 单次读取模型参数，批量计算并生成初始的全局 KV Cache，将其全量写入显存。
+- **Decode Stage（子回归解码阶段）**
+  - **定义：** 模型根据历史上下文，流式、逐个预测生成后续 Token 的阶段。
+  - **计算性质：** **Memory-bound（访存密集型 / I/O 密集型）**。
+  - **算子本质：** **GEMV (Matrix-Vector Multiplications，矩阵-向量乘法)**。
+  - **技术特征：** 每一步（Step）的输入仅为当前步的单一 Token $[1, d]$。每层 FFN 和 Attention 的权重矩阵必须完整地从远端物理显存（HBM）中读取一次，而硬件核心仅执行单行向量的乘加运算，计算访存比极底，GPU 算力核心长时间处于饥饿（Idle）状态。
+  - **速度下限决定因子：** 纯粹受限于物理显存带宽（HBM Bandwidth）。
+
 - Prefill 阶段是算力密集型，批量处理输入 prompt，GPU 利用率高；Decode 阶段是内存带宽密集型，每次只读权重、生成一个 token，GPU 大量空转。这个不对称性催生了 **Prefill/Decode 分离（PD 分离）**架构—把两个阶段放到不同的机器上跑，各自优化。
+
+#### 注意力控制与内存管理（Attention & Memory Management）
+
+- **Masked Self-Attention（掩码自注意力算子）**
+
+  - **因果掩码（Causal Mask）：** 在自回归生成中，为了防止并行的 Query 矩阵在预填充或训练阶段“窥探未来”，通过一个下三角掩码矩阵（右上角元素置为 $-\infty$），在经过 Softmax 激活层后将未来的注意力权重物理归零，强制维持时间的单向因果语义。
+  - **Decode 阶段的物理读取：** 当前步新生成的 Query 探针 $Q_t \ [1, d]$ 静态驻留在片上寄存器中，通过流式访存（Streaming Read）拉取物理显存中历史积攒的 $K_{1 \dots t}$ 和 $V_{1 \dots t}$ 缓存矩阵，通过两轮全量 HBM 搬运完成加权聚合。
+
+- **KV Cache Allocation（KV Cache 追加与累积）**
+
+  - **背景**：进行 KV Cache 追加与累积的本质，是为了在自回归解码（Decode）阶段，将计算复杂度从 $O(N^2)$ 的“全量重算”暴力退化为 $O(1)$ 的“增量流式计算”。它通过动态开辟物理显存空间，将历史算力沉淀固化为“有状态的缓存（Stateful Cache）”，从而解除大模型流式吐字时的算力死刑。
+
+  - **数学等价性约束：** 为了保证 Transformer 模型长文本关联的正确性，第 $t$ 步的 $Q_t$ 必须与前 $t-1$ 个历史位置的 $K, V$ 进行点积。
+
+  - **增量计算化（Stateful Stream Processing）：** 系统拒绝每步全量重算历史（避免 $O(N^2)$ 计算爆炸），转而采用类似流计算的“状态机”模式：将每步新投影出的 $K_t, V_t \ [1, d]$ **追加写入**物理内存的末尾。使单步计算复杂度死死钉在 $O(1)$ 常数级别。
+
+  - **显存线性开销（Linear Memory Footprint Explosion）：** KV Cache 空间消耗随序列长度 $N$ 呈 $O(N)$ 线性增长。
+
+    $$\text{单 Token 物理内存开销} = 2 \times \text{Layers} \times \text{Hidden Size} \times \text{Precision Bytes}$$
+
+    对于 70B 模型（80层，Hidden Size 8192，FP16），单并发每 1000 Token 消耗约 **320 MB**。
+
+  - **第一次点积（$Q \times K$）**：打破了静态网络的死板，让输入根据当前语境，**动态地、临时地**计算出一组“谁跟谁更重要”的权重。
+
+  - **第二次点积（$\text{Weights} \times V$）**：拿着这组临时计算出来的动态权重，把全网离散的历史长文本特征，**定向熔炼**成当前这一个步最需要的精准语义。
+
+- **PagedAttention（页面注意力 / 显存虚拟化）**
+
+  - **核心思想：** 复刻 Linux Kernel 的虚拟内存分页管理（Paging）机制。
+  - **Block（块）组织：** 彻底废除传统的“连续静态内存分配”，将物理显存切分为固定大小、离散的物理页块（Physical Blocks，如固定容纳 16 个 Token 的 KV）。
+  - **Page Table（页表）：** 引入逻辑块到物理块的动态映射路由表。允许同一个 Sequence 的 KV Cache 散落在物理显存的任意角落，消灭了**内部碎片（Internal Fragmentation）**与**外部碎片（External Fragmentation）**，将物理显存利用率暴力拉升至 96% 左右，直接释放了高并发（Batch Size）的上限。
+  - **生存周期调度（Swap Mechanism）：** 当长文本引发显存触顶时，触发 **Eviction Policy（淘汰置换策略）**，将挂起请求的 KV Cache 通过 PCIe 总线异步换出（Swap Out）至系统内存（CPU RAM），待调度恢复时再换入（Swap In）。
+
+#### 分布式与架构演进（Distributed Architecture & Topology）
+
+- **Tensor Parallelism (TP，张量并行)**
+  - **定义：** 针对单张 GPU 显存容量无法容纳超大模型（如 70B 模型体重约 140GB）的物理死锁，在 **算子内部（Intra-layer）** 将巨型参数矩阵沿着行（Row）或列（Col）切分到多张 GPU 上并行计算。
+  - **系统代价：** 极度依赖高频的跨卡同步算子（如 **All-Reduce**），必须通过极高带宽的片上互连总线（如 NVLink）进行对齐。
+- **Mixture of Experts (MoE，混合专家模型)**
+  - **结构流变：** 将传统稠密模型（Dense）体积最大的 FFN 层，拆分为数十个结构相同但参数独立的微型矩阵块（Experts）。
+  - **Router（路由网关）：** 每一步计算时，Router 根据 Token 的特征向量进行动态门控分发，通常仅激活其中的 Top-K（如 2 个）专家。
+  - **解题本质：** 完美对冲了 Decode 阶段的 FFN 访存瓶颈。将每步 Decode 必须加载的静态权重体积从全量（如 8.6GB）降至局部（如 1GB），大幅解放了单机 HBM 的带宽承载力。
+  - **派生瓶颈（Expert Parallelism, EP）：** 为了在物理上放下数百 G 的 MoE 全量参数，各专家被分布式离散驻留在集群的不同节点上。这导致推理时的瓶颈从“单机内 HBM 访存瓶颈”跃迁为了“跨机器网线间的 **All-to-All 路由通信网络雪崩瓶颈**”。
 
 #### KV Cache 管理：推理显存的核心战场
 
@@ -39,15 +95,14 @@
 #### 模型优化技术
 
 - **量化（Quantization）**是最直接的优化，将 FP16/BF16 权重压缩到更低精度：
-
   - `INT8`（W8A8）：权重和激活都量化到 8 位，几乎无精度损失，推理速度提升约 1.5-2×
-
+  
   - `FP8`（H100 原生支持）：兼顾精度与速度，目前最主流的量化方案
-
+  
   - `INT4`（GPTQ / AWQ）：激进量化，模型体积降至 FP16 的 1/4，速度提升 3-4×，有一定精度损失
-
+  
   - `KV Cache 量化`：KV Cache 也可以量化到 INT8/FP8，显存占用降低 50%
-
+  
 - **投机解码（Speculative Decoding）**是另一个重要技巧：用一个小的草稿模型（draft model）先快速生成几个 token，再用大模型并行验证，批量接受或拒绝。由于验证是并行的，如果草稿模型猜对率高，相当于每次 decode step 生成了多个 token，TTFT 不变但 TBT 显著降低，吞吐提升 2-3×。
 
 - **算子融合与图优化**：将 LayerNorm + QKV 投影、Attention + Softmax、FFN 的多个 CUDA kernel 融合成一个，减少内存往返和 kernel launch 开销。Flash Attention 是这一方向的标志性工作，把 Attention 的 HBM 访问从 O(n²) 降到 O(n)，对长序列效果尤为显著。
